@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import calendar
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -16,8 +17,47 @@ from textual.events import Click
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, ListItem, ListView, Static
 
-# TODO: filepath from .env
-DEVLOG_DIR = Path()
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+
+
+def read_dotenv_value(path: Path, key: str) -> Optional[str]:
+    if not path.exists():
+        return None
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+
+        name, value = line.split("=", 1)
+        if name.strip() != key:
+            continue
+
+        return value.strip().strip("'\"")
+
+    return None
+
+
+def load_devlog_dir() -> Path:
+    note_filepath = os.environ.get("NOTE_FILEPATH") or read_dotenv_value(
+        ENV_PATH, "NOTE_FILEPATH"
+    )
+    if not note_filepath:
+        raise RuntimeError(
+            "NOTE_FILEPATH is not set. Add it to .env or export it in the environment."
+        )
+
+    devlog_dir = Path(note_filepath).expanduser()
+    if devlog_dir.is_absolute():
+        return devlog_dir
+    return (ENV_PATH.parent / devlog_dir).resolve()
+
+
+DEVLOG_DIR = load_devlog_dir()
 
 TODO_RE = re.compile(r"^- \[([ x])\] (.+)$")
 DUE_RE = re.compile(r"^\s*-\s*Due:\s*(\d{4}-\d{2}-\d{2})\s*$")
