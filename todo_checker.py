@@ -4,6 +4,7 @@ from __future__ import annotations
 import calendar
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -137,6 +138,59 @@ def clear_todo_due_date(path: Path, todo: Todo) -> None:
     if 0 <= todo.due_line_index < len(lines):
         del lines[todo.due_line_index]
         write_lines(path, lines)
+
+
+def parse_due_date_value(due_date: Optional[str]) -> Optional[date]:
+    if not due_date:
+        return None
+
+    try:
+        return date.fromisoformat(due_date)
+    except ValueError:
+        return None
+
+
+def due_group_sort_key(due_date: Optional[str]) -> tuple[int, date | str]:
+    if due_date is None:
+        return (2, "")
+
+    parsed = parse_due_date_value(due_date)
+    if parsed is None:
+        return (1, due_date)
+
+    return (0, parsed)
+
+
+def format_due_group_label(due_date: Optional[str]) -> str:
+    if due_date is None:
+        return "No due date"
+
+    parsed = parse_due_date_value(due_date)
+    if parsed is None:
+        return due_date
+
+    days_left = (parsed - date.today()).days
+    if days_left >= 0:
+        return f"{due_date}  D-{days_left}"
+    return f"{due_date}  D+{abs(days_left)}"
+
+
+def group_todos_by_due_date(todos: list[Todo]) -> list[tuple[Optional[str], list[Todo]]]:
+    grouped: dict[Optional[str], list[Todo]] = defaultdict(list)
+
+    for todo in todos:
+        grouped[todo.due_date].append(todo)
+
+    grouped_items = list(grouped.items())
+    grouped_items.sort(key=lambda item: due_group_sort_key(item[0]))
+    return grouped_items
+
+
+def should_display_todo(todo: Todo) -> bool:
+    due_date = parse_due_date_value(todo.due_date)
+    if todo.checked and due_date is not None and due_date < date.today():
+        return False
+    return True
 
 
 class CalendarDay(Static):
@@ -374,6 +428,12 @@ class TodoRow(ListItem):
             self.due_label.add_class("no-due")
 
 
+class DueGroupHeaderRow(ListItem):
+    def __init__(self, due_date: Optional[str]):
+        self.label = Static(format_due_group_label(due_date), classes="group-header")
+        super().__init__(self.label, classes="group-header-row")
+
+
 class Ticker(App):
     CSS = """
     Screen {
@@ -400,6 +460,15 @@ class Ticker(App):
         width: 100%;
         height: auto;
         padding: 0 1;
+    }
+
+    .group-header-row {
+        padding: 1 1 0 1;
+    }
+
+    .group-header {
+        color: $accent;
+        text-style: bold;
     }
 
     .todo-text {
@@ -465,6 +534,7 @@ class Ticker(App):
         super().__init__()
         self.path = current_devlog_file()
         self.rows: list[TodoRow] = []
+        self.row_positions: dict[TodoRow, int] = {}
 
     def compose(self) -> ComposeResult:
         yield Static(self.ASCII_ART, id="ascii-art")
@@ -478,9 +548,15 @@ class Ticker(App):
         lv = self.query_one(ListView)
         if lv.index is None:
             return None
-        if lv.index < 0 or lv.index >= len(self.rows):
+
+        items = [child for child in lv.children if isinstance(child, ListItem)]
+        if lv.index < 0 or lv.index >= len(items):
             return None
-        return self.rows[lv.index]
+
+        selected = items[lv.index]
+        if not isinstance(selected, TodoRow):
+            return None
+        return selected
 
     def reload_rows(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,12 +565,23 @@ class Ticker(App):
         lv = self.query_one(ListView)
         lv.clear()
         self.rows = []
+        self.row_positions = {}
 
-        todos = parse_todos(self.path)
-        for todo in todos:
-            row = TodoRow(todo)
-            self.rows.append(row)
-            lv.append(row)
+        todos = [todo for todo in parse_todos(self.path) if should_display_todo(todo)]
+        list_index = 0
+        for due_date, grouped_todos in group_todos_by_due_date(todos):
+            lv.append(DueGroupHeaderRow(due_date))
+            list_index += 1
+
+            for todo in grouped_todos:
+                row = TodoRow(todo)
+                self.rows.append(row)
+                self.row_positions[row] = list_index
+                lv.append(row)
+                list_index += 1
+
+        if self.rows:
+            lv.index = self.row_positions[self.rows[0]]
 
     def action_reload(self) -> None:
         self.path = current_devlog_file()
@@ -535,10 +622,10 @@ class Ticker(App):
         self.reload_rows()
 
     def on_click(self, event: Click) -> None:
-        for idx, row in enumerate(self.rows):
+        for row in self.rows:
             if event.widget is row.due_label:
                 lv = self.query_one(ListView)
-                lv.index = idx
+                lv.index = self.row_positions[row]
                 self.push_screen(
                     DatePickerScreen(initial_date=row.todo.due_date),
                     callback=lambda selected, current_row=row: self._handle_due_date_selected(current_row, selected),
