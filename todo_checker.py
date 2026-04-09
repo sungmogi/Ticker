@@ -5,7 +5,7 @@ import calendar
 import os
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -60,8 +60,10 @@ def load_devlog_dir() -> Path:
 
 DEVLOG_DIR = load_devlog_dir()
 
-TODO_RE = re.compile(r"^- \[([ x])\] (.+)$")
-DUE_RE = re.compile(r"^\s*-\s*Due:\s*(\d{4}-\d{2}-\d{2})\s*$")
+TODO_RE = re.compile(r"^(?P<indent>\s*)- \[(?P<checked>[ x])\] (?P<text>.+)$")
+DUE_RE = re.compile(
+    r"^(?P<indent>\s*)-\s*Due:\s*(?P<due_date>\d{4}-\d{2}-\d{2})\s*$"
+)
 
 
 @dataclass
@@ -69,12 +71,55 @@ class Todo:
     line_index: int
     checked: bool
     text: str
+    indent: str = ""
     due_date: Optional[str] = None
     due_line_index: Optional[int] = None
+    parent_line_index: Optional[int] = None
+    child_line_indexes: list[int] = field(default_factory=list)
+
+    @property
+    def depth(self) -> int:
+        return indent_width(self.indent) // 4
+
+    @property
+    def is_subtask(self) -> bool:
+        return self.parent_line_index is not None
 
 
 def current_devlog_file() -> Path:
     return DEVLOG_DIR / datetime.now().strftime("%m_%Y.txt")
+
+
+def indent_width(indent: str) -> int:
+    return len(indent.expandtabs(4))
+
+
+def format_todo_line(todo: Todo, checked: bool) -> str:
+    return f"{todo.indent}- [{'x' if checked else ' '}] {todo.text}"
+
+
+def find_due_target(todos: list[Todo], due_indent: str) -> Optional[Todo]:
+    due_indent_width = indent_width(due_indent)
+
+    for todo in reversed(todos):
+        if indent_width(todo.indent) < due_indent_width:
+            return todo
+
+    return todos[-1] if todos else None
+
+
+def collect_descendant_line_indexes(
+    children_map: dict[int, list[int]], line_index: int
+) -> list[int]:
+    descendants: list[int] = []
+    stack = list(reversed(children_map.get(line_index, [])))
+
+    while stack:
+        child_line_index = stack.pop()
+        descendants.append(child_line_index)
+        stack.extend(reversed(children_map.get(child_line_index, [])))
+
+    return descendants
 
 
 def parse_todos(path: Path) -> list[Todo]:
@@ -83,26 +128,35 @@ def parse_todos(path: Path) -> list[Todo]:
 
     lines = path.read_text().splitlines()
     todos: list[Todo] = []
-    current: Optional[Todo] = None
+    stack: list[Todo] = []
 
     for idx, line in enumerate(lines):
-        stripped = line.strip()
-
-        todo_match = TODO_RE.match(stripped)
+        todo_match = TODO_RE.match(line)
         if todo_match:
+            indent = todo_match.group("indent")
+            while stack and indent_width(stack[-1].indent) >= indent_width(indent):
+                stack.pop()
+
+            parent = stack[-1] if stack else None
             current = Todo(
                 line_index=idx,
-                checked=(todo_match.group(1) == "x"),
-                text=todo_match.group(2),
+                checked=(todo_match.group("checked") == "x"),
+                text=todo_match.group("text"),
+                indent=indent,
+                parent_line_index=parent.line_index if parent else None,
             )
+            if parent is not None:
+                parent.child_line_indexes.append(current.line_index)
             todos.append(current)
+            stack.append(current)
             continue
 
-        if current is not None:
-            due_match = DUE_RE.match(stripped)
-            if due_match:
-                current.due_date = due_match.group(1)
-                current.due_line_index = idx
+        due_match = DUE_RE.match(line)
+        if due_match:
+            due_target = find_due_target(todos, due_match.group("indent"))
+            if due_target is not None:
+                due_target.due_date = due_match.group("due_date")
+                due_target.due_line_index = idx
 
     return todos
 
@@ -113,13 +167,41 @@ def write_lines(path: Path, lines: list[str]) -> None:
 
 def update_todo_checkbox(path: Path, todo: Todo, checked: bool) -> None:
     lines = path.read_text().splitlines()
-    lines[todo.line_index] = f"- [{'x' if checked else ' '}] {todo.text}"
+    todos = parse_todos(path)
+    todo_by_line_index = {current.line_index: current for current in todos}
+    target = todo_by_line_index.get(todo.line_index)
+    if target is None:
+        return
+
+    children_map = {
+        current.line_index: list(current.child_line_indexes) for current in todos
+    }
+    checked_state = {current.line_index: current.checked for current in todos}
+
+    checked_state[target.line_index] = checked
+    for descendant_line_index in collect_descendant_line_indexes(
+        children_map, target.line_index
+    ):
+        checked_state[descendant_line_index] = checked
+
+    for current in reversed(todos):
+        if current.child_line_indexes:
+            checked_state[current.line_index] = all(
+                checked_state[child_line_index]
+                for child_line_index in current.child_line_indexes
+            )
+
+    for current in todos:
+        lines[current.line_index] = format_todo_line(
+            current, checked_state[current.line_index]
+        )
+
     write_lines(path, lines)
 
 
 def update_todo_due_date(path: Path, todo: Todo, due_date: str) -> None:
     lines = path.read_text().splitlines()
-    due_line = f"    - Due: {due_date}"
+    due_line = f"{todo.indent}    - Due: {due_date}"
 
     if todo.due_line_index is not None and 0 <= todo.due_line_index < len(lines):
         lines[todo.due_line_index] = due_line
@@ -176,10 +258,41 @@ def format_due_group_label(due_date: Optional[str]) -> str:
 
 
 def group_todos_by_due_date(todos: list[Todo]) -> list[tuple[Optional[str], list[Todo]]]:
+    todo_by_line_index = {todo.line_index: todo for todo in todos}
+    children_map = {
+        todo.line_index: list(todo.child_line_indexes) for todo in todos
+    }
     grouped: dict[Optional[str], list[Todo]] = defaultdict(list)
+    emitted_line_indexes: set[int] = set()
 
     for todo in todos:
+        if todo.line_index in emitted_line_indexes:
+            continue
+
+        if todo.parent_line_index is not None:
+            parent = todo_by_line_index.get(todo.parent_line_index)
+            if parent is not None:
+                continue
+
+        if not should_display_todo(todo):
+            emitted_line_indexes.add(todo.line_index)
+            emitted_line_indexes.update(
+                collect_descendant_line_indexes(children_map, todo.line_index)
+            )
+            continue
+
         grouped[todo.due_date].append(todo)
+        emitted_line_indexes.add(todo.line_index)
+
+        for descendant_line_index in collect_descendant_line_indexes(
+            children_map, todo.line_index
+        ):
+            descendant = todo_by_line_index.get(descendant_line_index)
+            if descendant is None:
+                continue
+
+            grouped[todo.due_date].append(descendant)
+            emitted_line_indexes.add(descendant_line_index)
 
     grouped_items = list(grouped.items())
     grouped_items.sort(key=lambda item: due_group_sort_key(item[0]))
@@ -407,12 +520,15 @@ class TodoRow(ListItem):
         self.refresh_row()
 
     def render_todo_text(self) -> str:
+        prefix = "  " * self.todo.depth
         box = "☑" if self.todo.checked else "☐"
         if self.todo.checked:
-            return f"{box} [strike]{self.todo.text}[/strike]"
-        return f"{box} {self.todo.text}"
+            return f"{prefix}{box} [strike]{self.todo.text}[/strike]"
+        return f"{prefix}{box} {self.todo.text}"
 
     def render_due_text(self) -> str:
+        if self.todo.is_subtask:
+            return ""
         return self.todo.due_date if self.todo.due_date else "Set due"
 
     def refresh_row(self) -> None:
@@ -598,7 +714,7 @@ class Ticker(App):
 
     def action_edit_due_date(self) -> None:
         row = self.get_selected_row()
-        if row is None:
+        if row is None or row.todo.is_subtask:
             return
 
         self.push_screen(
@@ -615,7 +731,7 @@ class Ticker(App):
 
     def action_clear_due_date(self) -> None:
         row = self.get_selected_row()
-        if row is None:
+        if row is None or row.todo.is_subtask:
             return
 
         clear_todo_due_date(self.path, row.todo)
@@ -623,7 +739,7 @@ class Ticker(App):
 
     def on_click(self, event: Click) -> None:
         for row in self.rows:
-            if event.widget is row.due_label:
+            if event.widget is row.due_label and not row.todo.is_subtask:
                 lv = self.query_one(ListView)
                 lv.index = self.row_positions[row]
                 self.push_screen(
